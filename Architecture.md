@@ -1,8 +1,8 @@
 # Agentic-QuantRAG-Binance Architecture
 
 **Status:** Production-ready architectural baseline  
-**Version:** 1.0  
-**Date:** 2026-10-17  
+**Version:** 1.1  
+**Date:** 2026-10-18  
 **Source of truth:** [PRD.md](./PRD.md)
 
 ## 1. Architecture Overview
@@ -41,7 +41,7 @@ An LLM or autonomous agent may request analysis and propose intent, but it can n
 | Time-series/event store | Read/write | Market data, features, outcomes, audit events | Halt if point-in-time state cannot be trusted |
 | Secrets manager | Read | API credentials and provider secrets | Do not start live components |
 | Metrics and alerting system | Outbound | Operational health and risk alerts | Continue only if local safety logging remains available |
-| Operator dashboard | Read and control | Visibility, acknowledgements, kill switch | Local kill switch remains authoritative |
+| React operator workstation | Read and control | Visibility, acknowledgements, kill switch | Local kill switch remains authoritative |
 
 ### 2.2 Deployment modes
 
@@ -89,7 +89,8 @@ flowchart LR
     RG --> OBS
     RC --> OBS
     EA --> OBS
-    OBS --> UI[Operator dashboard]
+    OBS --> RM[Runtime read model]
+    RM --> UI[React + Tailwind operator workstation]
 ```
 
 ### 3.1 Decision sequence
@@ -156,7 +157,10 @@ Agentic-QuantRAG-Binance/
 │   ├── features/                         # point-in-time feature snapshots
 │   ├── labels/                           # reviewed sentiment/regime labels
 │   ├── replays/                          # deterministic replay fixtures
-│   └── reports/                          # generated research and cost reports
+│   ├── reports/                          # generated research and cost reports
+│   └── runtime/                          # read model written by src/main.py
+│       ├── latest_state.json             # atomically replaced current state
+│       └── execution_records.jsonl       # append-only iteration decision log
 ├── notebooks/
 │   ├── 01_data_quality.ipynb
 │   ├── 02_sentiment_evaluation.ipynb
@@ -258,6 +262,27 @@ Agentic-QuantRAG-Binance/
 │       ├── event_store.py                # raw and audit persistence
 │       ├── feature_store.py              # as-of feature retrieval
 │       └── outcome_store.py              # realized cost and PnL outcomes
+├── frontend/
+│   ├── package.json                       # React, Vite, Tailwind, and scripts
+│   ├── package-lock.json                  # locked frontend dependencies
+│   ├── vite.config.ts                     # SPA development/build configuration
+│   ├── tailwind.config.ts                 # warm-gold/matte-charcoal tokens
+│   ├── postcss.config.js                 # Tailwind PostCSS integration
+│   ├── index.html                         # SPA entry document
+│   └── src/
+│       ├── main.tsx                       # React bootstrap
+│       ├── App.tsx                        # workstation shell and polling lifecycle
+│       ├── index.css                      # Tailwind layers and global theme
+│       ├── types/
+│       │   └── runtime.ts                 # typed JSON state and record contracts
+│       ├── components/
+│       │   ├── Header.tsx                 # product and runtime identity
+│       │   ├── MetricBentoGrid.tsx        # regime, sentiment, order, volatility
+│       │   ├── ExecutionLog.tsx            # filtered historical records
+│       │   ├── RiskCharts.tsx              # trend and slippage visualizations
+│       │   └── StatusBadge.tsx             # executed/blocked state tags
+│       └── services/
+│           └── runtimeApi.ts              # read-only JSON polling client
 ├── tests/
 │   ├── conftest.py
 │   ├── fixtures/
@@ -377,6 +402,61 @@ The process entry point owns lifecycle orchestration:
 | exchange adapter | state/reconciliation | `OrderLifecycle` | Exchange IDs, status transitions, fills |
 | all components | audit/metrics | Structured events | Correlation ID, versions, timestamps |
 
+### 5.3 Decoupled frontend boundary
+
+The Python runtime is the data engine backend. `src/main.py` owns the
+continuous asynchronous loop and remains responsible for ingestion, RAG
+analysis, regime evaluation, slippage estimation, safety decisions, and
+shutdown. It does not render UI or import React concerns.
+
+At the end of every active loop iteration, `src/main.py` publishes a validated
+read model:
+
+| File | Write behavior | Consumer | Contract |
+|---|---|---|---|
+| `data/runtime/latest_state.json` | Atomic replacement | React SPA | One complete latest `DashboardState` object |
+| `data/runtime/execution_records.jsonl` | Append-only | React SPA | One validated `ExecutionRecord` per iteration |
+
+The files contain display-safe values only. They must not contain API keys,
+secrets, unrestricted account credentials, or unredacted provider responses.
+The frontend is read-only with respect to runtime decisions: it may filter,
+refresh, and visualize records, but it cannot mutate risk limits, submit
+orders, or control the backend process directly.
+
+The browser-facing delivery mechanism is deployment-specific. A static host,
+reverse proxy, or local development server may expose the runtime directory as
+read-only JSON endpoints. If the browser cannot safely access local files, a
+thin read-only HTTP adapter may serve these two files without moving trading
+logic into the frontend. The adapter must validate paths, apply origin and
+cache controls, and never expose the wider filesystem.
+
+### 5.4 React + Tailwind frontend
+
+`frontend/` contains a single-page React application built with Vite and
+styled with Tailwind CSS. `App.tsx` polls the two read-model resources on a
+bounded interval, validates the response against the TypeScript contracts in
+`frontend/src/types/runtime.ts`, and renders the latest state without owning
+any market or execution state.
+
+The SPA presentation follows the premium warm-gold/matte-charcoal language:
+
+- deep charcoal page and panel surfaces (`#121316`, `#16171B`, `#1C1D22`);
+- warm-gold structure and active values (`#E5A93C`, with `#D48C2A` for depth);
+- dim grey labels and metadata;
+- rounded bento metric blocks, responsive tables, and subdued amber tags for
+  blocked execution paths;
+- no bright default alert colors that obscure risk severity.
+
+React component responsibilities are intentionally narrow:
+
+1. `MetricBentoGrid` displays regime, sentiment, dynamic order limit, and
+   volatility.
+2. `ExecutionLog` validates and filters historical JSONL projections.
+3. `RiskCharts` visualizes risk and slippage trends from records only.
+4. `StatusBadge` consistently distinguishes executed and blocked paths.
+5. `runtimeApi` handles read-only polling, stale-data indicators, retry
+   backoff, and schema errors.
+
 ## 6. Data Streams and Flow
 
 ### 6.1 Market-data stream
@@ -438,7 +518,26 @@ ApprovedExecutionPlan
 
 Unknown exchange responses are not treated as rejected. The adapter must query/reconcile the exchange using the client-order ID before any retry or replacement.
 
-### 6.5 Audit and observability stream
+### 6.5 Runtime dashboard read-model stream
+
+```text
+Completed main.py iteration
+    -> assemble validated DashboardState
+    -> atomic replace data/runtime/latest_state.json
+    -> append validated ExecutionRecord to execution_records.jsonl
+    -> read-only JSON delivery boundary
+    -> React polling client
+    -> typed state validation
+    -> warm-gold metric bento grid, charts, and execution log
+```
+
+`latest_state.json` is the current-state projection and may be replaced
+atomically. `execution_records.jsonl` is the historical projection and must
+only be appended by the backend. A missing file is an explicit empty state,
+not a reason for the SPA to fabricate values. Malformed JSON, schema mismatch,
+or stale timestamps must produce a visible degraded-data state.
+
+### 6.6 Audit and observability stream
 
 All streams emit structured events to the audit layer:
 
@@ -464,6 +563,8 @@ Every event includes `event_id`, `event_time`, `process_time`, `correlation_id`,
 | Order lifecycle | execution gateway | Append-only event log | State transitions are validated |
 | Kill switches | risk/operator control | Durable and fail-safe | Explicit operator/system action |
 | Metrics and health | observability | Time-series retention | Append-only measurements |
+| Runtime dashboard snapshot | `src/main.py` | `data/runtime/latest_state.json` | Atomically replaced after each completed iteration |
+| Runtime execution history | `src/main.py` | `data/runtime/execution_records.jsonl` | Append-only, one validated record per iteration |
 
 ### 7.2 Core process state machine
 
@@ -638,14 +739,22 @@ Sensitive values must be redacted before persistence. API keys, secrets, and unr
 | Failure injection | Disconnects, stale data, unknown orders, gaps | Fail closed, safe-mode entry, recovery behavior |
 | Security | Prompt injection, secrets, permissions | Untrusted content isolation and no credential leakage |
 | Paper soak | Long-running simulated trading | Stability, queues, reconciliation, alerts, drawdown controls |
+| Frontend | React components and read-model client | Typed JSON parsing, polling, stale/empty/error states, responsive rendering |
 
 Promotion requires successful tests plus out-of-sample signal/regime evaluation, impact calibration, paper observation, and explicit risk-owner approval as specified in the PRD.
 
 ## 11. Operational Interfaces
 
-### 11.1 Operator dashboard read model
+### 11.1 React operator workstation
 
-The dashboard reads a safe, redacted projection containing:
+The primary operator interface is the decoupled React + Tailwind single-page
+application in `frontend/`. It reads only the backend's redacted runtime
+projection:
+
+- `data/runtime/latest_state.json` for the current state;
+- `data/runtime/execution_records.jsonl` for historical iterations.
+
+The SPA displays:
 
 - environment and lifecycle state;
 - source freshness and health;
@@ -656,6 +765,15 @@ The dashboard reads a safe, redacted projection containing:
 - blocked decisions and reason codes;
 - kill-switch and safe-mode state;
 - reconciliation status and last successful check.
+
+The frontend must show explicit loading, empty, stale, and schema-error states.
+It must never infer missing risk values, silently coerce malformed records, or
+present cached data as current without a timestamp indicator. Refreshing the
+SPA does not restart `src/main.py`.
+
+`src/dashboard.py`, if retained during migration, is a transitional local
+diagnostic and not the production frontend contract. New dashboard features
+must be implemented in `frontend/`; the Python runtime remains UI-agnostic.
 
 ### 11.2 Operator commands
 
@@ -682,7 +800,10 @@ The architecture is implemented when:
 - policy, impact, and risk controls are deterministic and independently testable;
 - safe-mode transitions and exchange reconciliation are implemented;
 - state variables have durable ownership and restart semantics;
-- audit, metrics, alerts, and dashboard projections are available;
+- audit, metrics, alerts, and JSON dashboard projections are available;
+- `frontend/` builds a decoupled React + Tailwind single-page workstation;
+- the SPA consumes only `latest_state.json` and `execution_records.jsonl`;
+- warm-gold/matte-charcoal presentation is responsive and does not use native
+  Streamlit metric components;
 - no agent or LLM can directly submit orders or alter safety controls;
 - tests cover normal flow, blocked flow, failure flow, and deterministic replay.
-
