@@ -221,6 +221,20 @@ class BinanceIngestor:
 
         return self._symbol
 
+    def set_symbol(self, symbol: str) -> None:
+        """Update the read-only market-data instrument for the next fetch."""
+
+        self._validate_configuration(
+            symbol=symbol,
+            order_book_limit=self._order_book_limit,
+            liquidation_lookback=self._liquidation_lookback,
+            liquidation_limit=self._liquidation_limit,
+            timeout_seconds=self._retry_policy.timeout_seconds,
+            max_retries=self._retry_policy.max_retries,
+            retry_base_delay_seconds=self._retry_policy.base_delay_seconds,
+        )
+        self._symbol = symbol
+
     @property
     def using_synthetic_fallback(self) -> bool:
         """Return whether absent credentials currently force synthetic mode."""

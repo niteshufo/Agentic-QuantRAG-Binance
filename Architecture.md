@@ -416,12 +416,16 @@ read model:
 |---|---|---|---|
 | `data/runtime/latest_state.json` | Atomic replacement | React SPA | One complete latest `DashboardState` object |
 | `data/runtime/execution_records.jsonl` | Append-only | React SPA | One validated `ExecutionRecord` per iteration |
+| `data/runtime/runtime_controls.json` | Atomic replacement by local dashboard | `src/main.py` | Validated operator controls such as baseline account cap and feed mode |
 
 The files contain display-safe values only. They must not contain API keys,
 secrets, unrestricted account credentials, or unredacted provider responses.
-The frontend is read-only with respect to runtime decisions: it may filter,
-refresh, and visualize records, but it cannot mutate risk limits, submit
-orders, or control the backend process directly.
+The read models remain backend-owned and are never overwritten by dashboard
+controls. Local operator controls use the separate `runtime_controls.json`
+boundary; `src/main.py` validates and applies the account baseline before the
+next regime evaluation, while invalid or stale controls are ignored safely.
+The frontend may filter, refresh, and visualize records, but it cannot submit
+orders or control the backend process directly.
 
 The browser-facing delivery mechanism is deployment-specific. A static host,
 reverse proxy, or local development server may expose the runtime directory as

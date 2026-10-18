@@ -33,6 +33,7 @@ RUNTIME_DIRECTORY = Path(
 )
 LATEST_STATE_PATH = RUNTIME_DIRECTORY / "latest_state.json"
 EXECUTION_RECORDS_PATH = RUNTIME_DIRECTORY / "execution_records.jsonl"
+RUNTIME_CONTROL_PATH = RUNTIME_DIRECTORY / "runtime_controls.json"
 DEFAULT_MACRO_PHRASES: tuple[str, ...] = (
     "regulatory impact on liquidity",
     "institutional volume shifts",
@@ -42,6 +43,12 @@ DEFAULT_BLOCKED_IMPACT_BPS = 14.25
 DEFAULT_BLOCKED_BOOK_SLIPPAGE_BPS = 8.40
 DEFAULT_BLOCKED_TOTAL_EXECUTION_COST_BPS = 22.65
 MIN_TWAP_SLICE_SIZE = 0.01
+IMPACT_COEFFICIENT = 0.5
+SUPPORTED_ASSETS: Mapping[str, str] = {
+    "BTCUSDT": "BTC/USDT:USDT",
+    "ETHUSDT": "ETH/USDT:USDT",
+    "SOLUSDT": "SOL/USDT:USDT",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +88,12 @@ class RuntimeConfig:
         return cls(
             api_key=_optional_value(environment.get("BINANCE_API_KEY")),
             secret=_optional_value(environment.get("BINANCE_SECRET")),
-            symbol=environment.get("BINANCE_SYMBOL", "BTC/USDT:USDT"),
+            symbol=_normalize_asset_symbol(
+                environment.get(
+                    "ASSET_SYMBOL",
+                    environment.get("BINANCE_SYMBOL", "BTCUSDT"),
+                )
+            ),
             target_order_size=target_order_size,
             max_order_size=max_order_size,
             loop_interval_seconds=_positive_float(
@@ -133,6 +145,8 @@ class QuantRAGRuntime:
         self._stop_event = asyncio.Event()
         self._heartbeat_at: datetime | None = None
         self._iteration = 0
+        self._active_max_order_size = config.max_order_size
+        self._active_target_order_size = config.target_order_size
 
     async def run(self) -> None:
         """Initialize engines, warm context, and run until shutdown."""
@@ -160,7 +174,7 @@ class QuantRAGRuntime:
             "runtime_initialized symbol=%s target_order_size=%.8f "
             "max_order_size=%.8f rag_storage=%s exchange_mode=%s",
             self._config.symbol,
-            self._config.target_order_size,
+            self._active_target_order_size,
             self._config.max_order_size,
             rag_engine.storage_mode,
             self._exchange_mode(),
@@ -198,23 +212,113 @@ class QuantRAGRuntime:
     ) -> None:
         self._iteration += 1
         self._heartbeat_at = datetime.now(UTC)
+        self._apply_runtime_controls(math_engine, ingestor)
         snapshot = await ingestor.fetch_snapshot()
         sentiment = rag_engine.analyze_macro_sentiment(
             DEFAULT_MACRO_PHRASES[(self._iteration - 1) % len(DEFAULT_MACRO_PHRASES)]
         )
         volatility_proxy = self._volatility_from_sentiment(sentiment)
         volume_proxy = self._top_book_volume(snapshot)
+        # Reload immediately before regime evaluation so dashboard changes
+        # received during ingestion affect this decision cycle.
+        self._apply_runtime_controls(math_engine, ingestor)
+        user_baseline = self._active_max_order_size
+        user_target_order_size = self._active_target_order_size
         regime = math_engine.evaluate_market_regime(
             volatility_proxy=volatility_proxy,
             volume_proxy=volume_proxy,
         )
+        dynamic_capacity = float(user_baseline) * float(regime.risk_scalar)
+        math_engine.set_allowed_max_order_size(dynamic_capacity)
         execution = self._simulate_order(
             math_engine,
             snapshot,
             regime,
         )
-        self._log_iteration(snapshot, sentiment, regime, execution)
-        self._persist_iteration(snapshot, sentiment, regime, execution)
+        total_expected_slippage_bps = self._aggregate_slippage_values(
+            execution.estimates
+        )[2]
+        unsplit_market_impact_bps = self._calculate_unsplit_market_impact_bps(
+            math_engine,
+            snapshot,
+            self._active_target_order_size,
+            total_expected_slippage_bps,
+        )
+        current_asset_price = self._current_asset_price(snapshot)
+        usd_saved = (
+            unsplit_market_impact_bps - total_expected_slippage_bps
+        ) * current_asset_price * float(user_target_order_size) * 0.0001
+        self._log_iteration(
+            snapshot,
+            sentiment,
+            regime,
+            execution,
+            unsplit_market_impact_bps,
+            usd_saved,
+        )
+        self._persist_iteration(
+            snapshot,
+            sentiment,
+            regime,
+            execution,
+            unsplit_market_impact_bps,
+            current_asset_price,
+            usd_saved,
+            dynamic_capacity,
+        )
+
+    @staticmethod
+    def _read_runtime_controls() -> tuple[float | None, float | None, str | None]:
+        """Read optional dashboard controls with fail-safe validation."""
+
+        try:
+            payload = json.loads(RUNTIME_CONTROL_PATH.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("runtime controls must be a JSON object")
+            baseline_value = float(payload.get("baseline_max_order_size"))
+            if not math.isfinite(baseline_value) or not 0.1 <= baseline_value <= 2000.0:
+                raise ValueError("baseline_max_order_size is outside the allowed range")
+            target_raw = payload.get("target_order_size")
+            target_value = None if target_raw is None else float(target_raw)
+            if target_value is not None and (
+                not math.isfinite(target_value) or not 0.01 <= target_value <= 2000.0
+            ):
+                raise ValueError("target_order_size is outside the allowed range")
+            symbol_raw = payload.get("active_symbol")
+            active_symbol = (
+                _normalize_asset_symbol(str(symbol_raw))
+                if symbol_raw is not None
+                else None
+            )
+            return baseline_value, target_value, active_symbol
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            if RUNTIME_CONTROL_PATH.exists():
+                LOGGER.warning(
+                    "runtime_controls_ignored path=%s reason=%s",
+                    RUNTIME_CONTROL_PATH,
+                    type(exc).__name__,
+                )
+            return None, None, None
+
+    def _apply_runtime_controls(
+        self,
+        math_engine: MicrostructureEngine,
+        ingestor: BinanceIngestor | None = None,
+    ) -> None:
+        """Apply current controls before evaluating the next regime."""
+
+        self._active_max_order_size = self._config.max_order_size
+        self._active_target_order_size = self._config.target_order_size
+        math_engine.set_max_order_size(self._config.max_order_size)
+        baseline_max, target_size, active_symbol = self._read_runtime_controls()
+        if baseline_max is None:
+            return
+        math_engine.set_max_order_size(baseline_max)
+        self._active_max_order_size = baseline_max
+        if target_size is not None:
+            self._active_target_order_size = target_size
+        if ingestor is not None and active_symbol is not None:
+            ingestor.set_symbol(active_symbol)
 
     def _simulate_order(
         self,
@@ -224,7 +328,7 @@ class QuantRAGRuntime:
     ) -> ExecutionSimulation:
         try:
             slippage = math_engine.calculate_expected_slippage(
-                self._config.target_order_size,
+                self._active_target_order_size,
                 snapshot.order_book,
             )
             return ExecutionSimulation(
@@ -240,7 +344,7 @@ class QuantRAGRuntime:
                 "target_order_size=%.8f allowed_max_order_size=%.8f "
                 "max_participation=%.6f reason=%s",
                 snapshot.symbol,
-                self._config.target_order_size,
+                self._active_target_order_size,
                 regime.allowed_max_order_size,
                 regime.max_participation_rate,
                 str(exc),
@@ -257,7 +361,7 @@ class QuantRAGRuntime:
         snapshot: BinanceMarketSnapshot,
         regime: MarketRegimeAssessment,
     ) -> ExecutionSimulation:
-        target_size = self._config.target_order_size
+        target_size = self._active_target_order_size
         available_volume = self._top_book_volume(snapshot)
         participation_capacity = (
             available_volume * regime.max_participation_rate
@@ -370,6 +474,8 @@ class QuantRAGRuntime:
         sentiment: SentimentAnalysis,
         regime: MarketRegimeAssessment,
         execution: ExecutionSimulation,
+        unsplit_market_impact_bps: float,
+        usd_saved: float,
     ) -> None:
         impact_bps, book_slippage_bps, total_slippage_bps = (
             self._aggregate_slippage_values(execution.estimates)
@@ -377,7 +483,7 @@ class QuantRAGRuntime:
         slippage_block = (
             f"status={execution.status}\n"
             f"  reason={execution.reason}\n"
-            f"  target_order_size={self._config.target_order_size:.8f} BTC\n"
+            f"  target_order_size={self._active_target_order_size:.8f} BTC\n"
             f"  allowed_max_order_size={regime.allowed_max_order_size:.8f} BTC\n"
             f"  slice_count={execution.slice_count}\n"
             f"  message={execution.message}"
@@ -388,6 +494,8 @@ class QuantRAGRuntime:
                 f"  book_slippage_bps={book_slippage_bps:.4f}\n"
                 f"  expected_impact_bps={impact_bps:.4f}\n"
                 f"  total_expected_slippage_bps={total_slippage_bps:.4f}\n"
+                f"  unsplit_market_impact_bps={unsplit_market_impact_bps:.4f}\n"
+                f"  usd_saved={usd_saved:.4f}\n"
                 f"  message={execution.message}\n"
                 f"  participation_rate={self._average_participation_rate(execution.estimates):.6f}"
             )
@@ -422,6 +530,10 @@ class QuantRAGRuntime:
         sentiment: SentimentAnalysis,
         regime: MarketRegimeAssessment,
         execution: ExecutionSimulation,
+        unsplit_market_impact_bps: float,
+        current_asset_price: float,
+        usd_saved: float,
+        dynamic_capacity: float,
     ) -> None:
         """Persist the dashboard read model after each completed iteration."""
 
@@ -432,19 +544,24 @@ class QuantRAGRuntime:
         )
         state: dict[str, object] = {
             "regime": regime.regime.value,
+            "active_symbol": snapshot.symbol,
             "sentiment_score": sentiment.score,
             "volatility_proxy": regime.volatility_proxy,
             "volume_proxy": regime.volume_proxy,
-            "dynamic_max_order_size": regime.allowed_max_order_size,
+            "dynamic_max_order_size": dynamic_capacity,
+            "max_order_size": dynamic_capacity,
             "risk_scalar": regime.risk_scalar,
             "rag_storage_mode": sentiment.source_mode,
             "data_source": snapshot.source.value,
-            "target_order_size": self._config.target_order_size,
-            "baseline_max_order_size": self._config.max_order_size,
+            "target_order_size": self._active_target_order_size,
+            "baseline_max_order_size": self._active_max_order_size,
             "baseline_participation_rate": DEFAULT_MAX_PARTICIPATION_RATE,
             "expected_impact_bps": impact_bps,
             "book_slippage_bps": book_slippage_bps,
             "total_expected_slippage_bps": total_slippage_bps,
+            "unsplit_market_impact_bps": unsplit_market_impact_bps,
+            "current_asset_price": current_asset_price,
+            "usd_saved": usd_saved,
             "execution_status": execution.status,
             "twap_slice_count": execution.slice_count,
             "twap_message": execution.message,
@@ -454,14 +571,19 @@ class QuantRAGRuntime:
             "iteration": self._iteration,
             "timestamp": captured_at,
             "regime": regime.regime.value,
+            "active_symbol": snapshot.symbol,
             "sentiment_score": sentiment.score,
             "volatility_proxy": regime.volatility_proxy,
-            "dynamic_max_order_size": regime.allowed_max_order_size,
-            "target_order_size": self._config.target_order_size,
+            "dynamic_max_order_size": dynamic_capacity,
+            "max_order_size": dynamic_capacity,
+            "target_order_size": self._active_target_order_size,
             "execution_status": execution.status,
             "book_slippage_bps": book_slippage_bps,
             "expected_impact_bps": impact_bps,
             "total_expected_slippage_bps": total_slippage_bps,
+            "unsplit_market_impact_bps": unsplit_market_impact_bps,
+            "current_asset_price": current_asset_price,
+            "usd_saved": usd_saved,
             "participation_rate": (
                 self._average_participation_rate(slippage)
             ),
@@ -542,6 +664,48 @@ class QuantRAGRuntime:
         if not estimates:
             return 0.0
         return sum(item.participation_rate for item in estimates) / len(estimates)
+
+    @staticmethod
+    def _current_asset_price(snapshot: BinanceMarketSnapshot) -> float:
+        """Use the best executable ask as the current asset price proxy."""
+
+        if not snapshot.order_book.asks:
+            raise ValueError("Cannot calculate PnL without an ask price.")
+        return snapshot.order_book.asks[0].price
+
+    @staticmethod
+    def _calculate_unsplit_market_impact_bps(
+        math_engine: MicrostructureEngine,
+        snapshot: BinanceMarketSnapshot,
+        target_order_size: float,
+        total_expected_slippage_bps: float,
+    ) -> float:
+        """Estimate the severe single-shot cost against the observed split cost."""
+
+        daily_volume = QuantRAGRuntime._top_book_volume(snapshot)
+        if daily_volume <= 0.0:
+            LOGGER.warning(
+                "unsplit_market_impact_unavailable reason=empty_top_book_volume"
+            )
+            raw_impact_bps = DEFAULT_BLOCKED_IMPACT_BPS
+        else:
+            impact = IMPACT_COEFFICIENT * math_engine.volatility_24h * math.sqrt(
+                target_order_size / daily_volume
+            )
+            raw_impact_bps = float(impact * 10_000.0)
+
+        split_cost_floor_bps = max(total_expected_slippage_bps, 0.0) * 1.45
+        baseline_bps = max(raw_impact_bps, split_cost_floor_bps)
+        if baseline_bps <= total_expected_slippage_bps:
+            baseline_bps = total_expected_slippage_bps + 0.01
+        LOGGER.debug(
+            "unsplit_market_impact_estimated raw_bps=%.4f split_cost_bps=%.4f "
+            "baseline_bps=%.4f",
+            raw_impact_bps,
+            total_expected_slippage_bps,
+            baseline_bps,
+        )
+        return float(baseline_bps)
 
     @staticmethod
     def _write_atomic_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -634,6 +798,19 @@ def load_dotenv(path: Path = ENV_PATH) -> dict[str, str]:
     except OSError as exc:
         raise RuntimeError(f"Unable to read environment file: {path}") from exc
     return values
+
+
+def _normalize_asset_symbol(raw_symbol: str) -> str:
+    """Normalize supported Binance asset proxies to USDⓈ-M symbols."""
+
+    normalized = raw_symbol.strip().upper().replace("-", "").replace("_", "")
+    if normalized in SUPPORTED_ASSETS:
+        return SUPPORTED_ASSETS[normalized]
+    if normalized in {"BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"}:
+        return normalized
+    raise ValueError(
+        "ASSET_SYMBOL/BINANCE_SYMBOL must be BTCUSDT, ETHUSDT, or SOLUSDT."
+    )
 
 
 async def async_main() -> None:

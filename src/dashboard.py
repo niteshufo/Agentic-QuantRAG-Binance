@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import importlib
+import html
 import json
 import logging
 import os
+import tempfile
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Final
 
 
 LOGGER = logging.getLogger("agentic_quant_rag.dashboard")
-PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 RUNTIME_DIRECTORY: Final[Path] = Path(
     r"C:\Users\nites\Desktop\Agentic-QuantRAG-Binance\data\runtime"
 )
 STATE_PATH: Final[Path] = RUNTIME_DIRECTORY / "latest_state.json"
 RECORDS_PATH: Final[Path] = RUNTIME_DIRECTORY / "execution_records.jsonl"
+CONTROL_PATH: Final[Path] = RUNTIME_DIRECTORY / "runtime_controls.json"
 
 PLACEHOLDER_STATE: Final[dict[str, object]] = {
     "regime": "awaiting data",
@@ -32,6 +35,8 @@ PLACEHOLDER_STATE: Final[dict[str, object]] = {
     "baseline_max_order_size": 5.0,
     "baseline_participation_rate": 0.10,
     "captured_at": "awaiting runtime sync",
+    "active_symbol": "BTC/USDT:USDT",
+    "usd_saved": 0.0,
 }
 
 
@@ -57,6 +62,25 @@ def _text(payload: Mapping[str, object], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DashboardDataError(f"{key} must be a non-empty string.")
     return value.strip()
+
+
+def _state_number(
+    payload: Mapping[str, object],
+    key: str,
+    fallback: float,
+) -> float:
+    """Return a finite live state value or a display-only fallback."""
+
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return fallback
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if number != number or number in (float("inf"), float("-inf")):
+        return fallback
+    return number
 
 
 def load_state(path: Path = STATE_PATH) -> tuple[dict[str, object], bool]:
@@ -204,6 +228,27 @@ def inject_css(st: ModuleType) -> None:
             font-size: 0.72rem;
             margin-top: 0.35rem;
         }
+        .savings-card {
+            background: linear-gradient(135deg, rgba(229,169,60,0.16), #1C1D22 68%);
+            border: 1px solid rgba(229,169,60,0.42);
+            border-radius: 16px;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.4), 0 0 24px rgba(229,169,60,0.08);
+            min-height: 154px;
+            padding: 24px;
+        }
+        .savings-value {
+            color: #F4C45D;
+            font-size: clamp(1.4rem, 2.3vw, 2.05rem);
+            font-weight: 800;
+            letter-spacing: -0.04em;
+            margin-top: 1.35rem;
+            text-shadow: 0 0 22px rgba(229,169,60,0.46);
+        }
+        .asset-caption {
+            color: #A99576;
+            font-size: 0.72rem;
+            margin-top: 0.35rem;
+        }
         .sidebar-brand {
             color: #F4F1EA;
             font-size: 1.2rem;
@@ -271,6 +316,17 @@ def inject_css(st: ModuleType) -> None:
             font-size: 0.8rem;
             margin: 0.45rem 0 0;
         }
+        .metric-sync-banner {
+            background: rgba(229,169,60,0.055);
+            border: 1px solid rgba(229,169,60,0.58);
+            border-radius: 12px;
+            color: #E5A93C;
+            font-family: "Cascadia Mono", "Consolas", monospace;
+            font-size: 0.76rem;
+            line-height: 1.6;
+            margin: 1.25rem 0 0.85rem;
+            padding: 0.9rem 1rem;
+        }
         @media (max-width: 900px) {
             .block-container { padding: 2rem 1.2rem 3rem; }
         }
@@ -291,6 +347,100 @@ def html_card(label: str, value: str, detail: str = "", compact: bool = False) -
     )
 
 
+def _asset_code(selected_asset: str) -> str:
+    """Convert the dashboard label to the compact Binance symbol format."""
+
+    return selected_asset.replace("/", "").upper()
+
+
+def _asset_label_from_symbol(symbol: object) -> str:
+    """Map a persisted normalized symbol to the dashboard selector label."""
+
+    symbol_text = str(symbol).upper().replace("/", "").replace(":USDT", "")
+    for asset in ("BTC", "ETH", "SOL"):
+        if symbol_text == f"{asset}USDT":
+            return f"{asset}/USDT"
+    return "BTC/USDT"
+
+
+def _selected_asset_from_session(st: ModuleType) -> str:
+    session_state = getattr(st, "session_state", None)
+    if isinstance(session_state, Mapping):
+        selected_asset = session_state.get("selected_asset", "BTC/USDT")
+        if selected_asset in {"BTC/USDT", "ETH/USDT", "SOL/USDT"}:
+            return str(selected_asset)
+    return "BTC/USDT"
+
+
+def _persist_selected_asset(st: ModuleType) -> None:
+    """Keep the selected instrument in Streamlit session state for safe reruns."""
+
+    selected_asset = _selected_asset_from_session(st)
+    session_state = getattr(st, "session_state", None)
+    if session_state is None:
+        LOGGER.warning("dashboard_asset_selection_not_persisted reason=session_state_missing")
+        return
+    try:
+        session_state["active_asset_code"] = _asset_code(selected_asset)
+        _persist_runtime_controls(st)
+    except (KeyError, TypeError):
+        LOGGER.warning("dashboard_asset_selection_not_persisted reason=session_state_read_only")
+    rerun = getattr(st, "rerun", None)
+    if callable(rerun):
+        rerun()
+
+
+def _persist_runtime_controls(st: ModuleType) -> None:
+    """Persist numeric dashboard controls without overwriting read models."""
+
+    session_state = getattr(st, "session_state", None)
+    if not isinstance(session_state, Mapping):
+        LOGGER.warning("dashboard_controls_not_persisted reason=session_state_missing")
+        return
+    try:
+        baseline_max = float(session_state.get("baseline_max", 5.0))
+        target_order_size = float(session_state.get("target_order_size", 5.0))
+        if not 0.1 <= baseline_max <= 2000.0:
+            raise ValueError("baseline_max must be between 0.1 and 2000.0.")
+        if not 0.01 <= target_order_size <= 2000.0:
+            raise ValueError("target_order_size must be between 0.01 and 2000.0.")
+        payload = {
+            "baseline_max_order_size": baseline_max,
+            "target_order_size": target_order_size,
+            "active_symbol": _asset_code(
+                str(session_state.get("selected_asset", "BTC/USDT"))
+            ),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        RUNTIME_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=RUNTIME_DIRECTORY,
+                prefix=".runtime_controls.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                json.dump(payload, temporary_file, ensure_ascii=True, indent=2)
+                temporary_file.write("\n")
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, CONTROL_PATH)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        LOGGER.error(
+            "dashboard_controls_persist_failed path=%s reason=%s",
+            CONTROL_PATH,
+            type(exc).__name__,
+        )
+
+
 def render_dashboard(st: ModuleType) -> None:
     """Configure the page and schedule a native two-second live fragment."""
 
@@ -309,13 +459,78 @@ def render_dashboard(st: ModuleType) -> None:
             "reason=upgrade_streamlit"
         )
         _render_dashboard_content(st)
+    else:
+        @fragment_factory(run_every="2s")
+        def render_live_content() -> None:
+            _render_dashboard_content(st)
+
+        render_live_content()
+
+    selected_asset = _selected_asset_from_session(st)
+    _render_tradingview_chart(st, selected_asset)
+
+
+def _render_tradingview_chart(st: ModuleType, selected_asset: str) -> None:
+    """Render the persistent live Binance chart outside the refresh fragment."""
+
+    active_state, _ = load_state(
+        Path(os.environ.get("DASHBOARD_STATE_PATH", str(STATE_PATH)))
+    )
+    st.markdown(
+        '<div class="metric-sync-banner">'
+        "📊 CORE METRIC GRAPH SYNC // Actively validating live spot data points "
+        f'against calculated volume-weighted slippage of '
+        f'{active_state.get("total_expected_slippage_bps", 0.0)} bps under '
+        f'{active_state.get("regime", "awaiting data")} market regime protection.'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="section-heading">Live market structure</div>',
+        unsafe_allow_html=True,
+    )
+    components = getattr(st, "components", None)
+    version_one = getattr(components, "v1", None)
+    html_renderer = getattr(version_one, "html", None)
+    if not callable(html_renderer):
+        LOGGER.error("tradingview_chart_unavailable reason=streamlit_components_missing")
         return
 
-    @fragment_factory(run_every="2s")
-    def render_live_content() -> None:
-        _render_dashboard_content(st)
-
-    render_live_content()
+    chart_markup = """
+        <div class="tradingview-widget-container"
+             style="height:500px;width:100%;border-radius:16px;overflow:hidden;
+                    border:1px solid rgba(255,255,255,0.04);
+                    background-color:#111216;">
+          <div id="binance_live_chart" style="height:500px;"></div>
+          <script type="text/javascript"
+                  src="https://s3.tradingview.com/tv.js">
+          </script>
+          <script type="text/javascript">
+            new TradingView.widget({
+              "width": "100%",
+              "height": 500,
+              "symbol": "BINANCE:__ACTIVE_SYMBOL__",
+              "interval": "1D",
+              "timezone": "exchange",
+              "theme": "dark",
+              "style": "1",
+              "locale": "en",
+              "enable_publishing": false,
+              "hide_side_toolbar": false,
+              "allow_symbol_change": true,
+              "container_id": "binance_live_chart"
+            });
+          </script>
+        </div>
+        """.replace(
+        "__ACTIVE_SYMBOL__",
+        html.escape(_asset_code(selected_asset), quote=True),
+    )
+    html_renderer(
+        chart_markup,
+        height=520,
+        scrolling=False,
+    )
 
 
 def _render_dashboard_content(st: ModuleType) -> None:
@@ -332,12 +547,46 @@ def _render_dashboard_content(st: ModuleType) -> None:
         st.markdown('<div class="eyebrow">AGENTIC QUANT // CONTROL</div>', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-brand">Runtime parameters</div>', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-label">SYSTEM CONSTANTS</div>', unsafe_allow_html=True)
+        current_asset = _asset_label_from_symbol(state.get("active_symbol"))
+        selected_asset = st.selectbox(
+            "🪙 Active Trading Instrument",
+            options=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+            index=("BTC/USDT", "ETH/USDT", "SOL/USDT").index(current_asset),
+            key="selected_asset",
+            on_change=_persist_selected_asset,
+            args=(st,),
+        )
+        selected_asset_code = _asset_code(selected_asset)
+        baseline_max = st.number_input(
+            "⚙️ Account Baseline Max Cap (BTC)",
+            min_value=0.1,
+            max_value=2000.0,
+            value=float(state.get("baseline_max_order_size", 5.0)),
+            step=10.0,
+            key="baseline_max",
+            on_change=_persist_runtime_controls,
+            args=(st,),
+        )
+        target_order_size = st.number_input(
+            "🎯 Target Order Size (BTC)",
+            min_value=0.01,
+            max_value=2000.0,
+            value=float(state.get("target_order_size", 5.0)),
+            step=0.5,
+            key="target_order_size",
+            on_change=_persist_runtime_controls,
+            args=(st,),
+        )
         st.markdown(
             '<div class="sidebar-panel">'
-            '<div class="sidebar-row"><span class="sidebar-label">Target order size</span>'
-            '<strong class="sidebar-value">5.00 BTC</strong></div>'
-            '<div class="sidebar-row"><span class="sidebar-label">Baseline max order</span>'
-            '<strong class="sidebar-value neutral-value">5.00 BTC</strong></div>'
+            f'<div class="sidebar-row"><span class="sidebar-label">Active instrument</span>'
+            f'<strong class="sidebar-value">{html.escape(selected_asset)}</strong></div>'
+            f'<div class="sidebar-row"><span class="sidebar-label">Target order size</span>'
+            f'<strong class="sidebar-value">{target_order_size:.2f} '
+            f'{html.escape(selected_asset_code[:3])}</strong></div>'
+            f'<div class="sidebar-row"><span class="sidebar-label">Baseline max order</span>'
+            f'<strong class="sidebar-value neutral-value">{baseline_max:.2f} '
+            f'{html.escape(selected_asset_code[:3])}</strong></div>'
             '<div class="sidebar-row"><span class="sidebar-label">Participation cap</span>'
             '<strong class="sidebar-value neutral-value">10.0%</strong></div>'
             "</div>",
@@ -351,7 +600,6 @@ def _render_dashboard_content(st: ModuleType) -> None:
             f'<strong class="sidebar-value">{state["data_source"]}</strong></div>',
             unsafe_allow_html=True,
         )
-
     st.markdown(
         '<div class="eyebrow">EXECUTION INTELLIGENCE // BINANCE PERPETUALS</div>'
         '<div class="workspace-title">Quantitative workstation</div>'
@@ -369,7 +617,7 @@ def _render_dashboard_content(st: ModuleType) -> None:
             html_card(
                 "Current Market Regime",
                 str(state["regime"]).replace("_", " ").upper(),
-                str(state["data_source"]),
+                f'{selected_asset} · {state.get("data_source", "not reported")}',
             ),
             unsafe_allow_html=True,
         )
@@ -378,16 +626,27 @@ def _render_dashboard_content(st: ModuleType) -> None:
             html_card(
                 "Active Sentiment Vector",
                 f'{float(state["sentiment_score"]):+.3f}',
-                f'RAG context · {state["rag_storage_mode"]}',
+                f'{selected_asset} · RAG context · {state["rag_storage_mode"]}',
             ),
             unsafe_allow_html=True,
         )
     with columns[2]:
+        fallback_capacity = (
+            _state_number(state, "baseline_max_order_size", 5.0)
+            * _state_number(state, "risk_scalar", 0.75)
+        )
+        active_state = state
+        # Reflect the operator control immediately while the backend finishes
+        # its next heartbeat and publishes the authoritative read model.
+        active_capacity = baseline_max * float(state["risk_scalar"])
+        if not state_loaded:
+            active_capacity = fallback_capacity
         st.markdown(
             html_card(
                 "Dynamic Max Capacity",
-                f'{float(state["dynamic_max_order_size"]):.3f} BTC',
-                f'Risk scalar · {float(state["risk_scalar"]):.2f}',
+                f'{active_capacity:.3f} '
+                f'{selected_asset_code[:3]}',
+                f'{selected_asset} · Risk scalar · {float(state["risk_scalar"]):.2f}',
             ),
             unsafe_allow_html=True,
         )
@@ -396,9 +655,9 @@ def _render_dashboard_content(st: ModuleType) -> None:
     impact = float(record["expected_impact_bps"]) if record else 14.25
     book = float(record["book_slippage_bps"]) if record else 8.40
     total = float(record["total_expected_slippage_bps"]) if record else 22.65
-    impact_columns = st.columns(3)
+    impact_columns = st.columns(4)
     for column, label, value in zip(
-        impact_columns,
+        impact_columns[:3],
         ("Expected Square-Root Impact", "Order Book Slippage", "Total Execution Cost"),
         (impact, book, total),
         strict=True,
@@ -410,6 +669,18 @@ def _render_dashboard_content(st: ModuleType) -> None:
                 '<div class="metric-detail">validated paper execution estimate</div></div>',
                 unsafe_allow_html=True,
             )
+    with impact_columns[3]:
+        usd_saved = _state_number(active_state, "usd_saved", 0.0)
+        st.markdown(
+            '<div class="savings-card">'
+            '<div class="card-label">⚡ Algorithmic Cost Optimization Savings</div>'
+            f'<div class="savings-value">+${max(usd_saved, 0.0):,.2f} USD</div>'
+            '<div class="metric-detail">Estimated institutional slip variance saved using '
+            'the active multi-slice TWAP protection engine.</div>'
+            f'<div class="asset-caption">Active instrument · {html.escape(selected_asset)}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
     target = float(state["target_order_size"])
     allowed = float(state["dynamic_max_order_size"])

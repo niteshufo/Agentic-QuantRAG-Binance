@@ -299,6 +299,19 @@ class MicrostructureEngine:
         )
         return assessment
 
+    def set_max_order_size(self, max_order_size: float) -> None:
+        """Update the reviewed account cap for the next regime evaluation."""
+
+        self._validate_positive(max_order_size, "max_order_size")
+        self._max_order_size = max_order_size
+        self._allowed_max_order_size = max_order_size
+
+    def set_allowed_max_order_size(self, allowed_max_order_size: float) -> None:
+        """Set the evaluated capacity used by the next execution calculation."""
+
+        self._validate_positive(allowed_max_order_size, "allowed_max_order_size")
+        self._allowed_max_order_size = allowed_max_order_size
+
     def _book_arrays(
         self,
         levels: tuple[object, ...],
